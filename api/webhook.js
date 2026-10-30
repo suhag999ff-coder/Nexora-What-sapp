@@ -1,260 +1,453 @@
+/**
+ * NEXORA WhatsApp Cloud API Webhook
+ * File: api/webhook.js
+ * Node.js 18+ | Vercel
+ *
+ * REQUIRED ENV:
+ * WHATSAPP_VERIFY_TOKEN
+ * WHATSAPP_ACCESS_TOKEN
+ * WHATSAPP_PHONE_NUMBER_ID
+ * META_APP_SECRET
+ * UPSTASH_REDIS_REST_URL
+ * UPSTASH_REDIS_REST_TOKEN
+ *
+ * OPTIONAL ENV:
+ * GRAPH_API_VERSION=v26.0
+ * AUTO_REPLY_RULES
+ * DEFAULT_AUTO_REPLY
+ */
 
-// ==========================================
-// NEXORA AI - WHATSAPP AUTO REPLY SYSTEM
-// Node.js + Vercel + WhatsApp Cloud API
-// ==========================================
+const crypto = require("node:crypto");
 
-const crypto = require("crypto");
+const GRAPH_VERSION = process.env.GRAPH_API_VERSION || "v26.0";
+const GRAPH_BASE = `https://graph.facebook.com/${GRAPH_VERSION}`;
+const MAX_BODY_BYTES = Number(process.env.WEBHOOK_MAX_BODY_BYTES || 1048576);
+const DEDUPE_TTL_SECONDS = 604800;
+const TIMEOUT_MS = 12000;
 
-const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
-const ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
-const PHONE_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
-const APP_SECRET = process.env.META_APP_SECRET;
-
-const GRAPH_VERSION =
-  process.env.GRAPH_API_VERSION || "v23.0";
-
-// AUTO REPLY KEYWORDS
-const DEFAULT_RULES = [
-  {
-    keywords: ["hi", "hello", "hey"],
-    reply: "Hello! 👋 Welcome to NEXORA AI."
-  },
-  {
-    keywords: ["salam", "assalamu alaikum"],
-    reply: "Wa Alaikum Assalam! ❤️"
-  },
-  {
-    keywords: ["price", "দাম"],
-    reply: "কোন পণ্যের দাম জানতে চান?"
-  },
-  {
-    keywords: ["help", "সাহায্য"],
-    reply: "কীভাবে আপনাকে সাহায্য করতে পারি?"
-  },
-  {
-    keywords: ["location", "ঠিকানা"],
-    reply: "আমাদের লোকেশন জানতে মেসেজ করুন।"
-  }
-];
-
-// LOAD CUSTOM RULES FROM VERCEL
-function getRules() {
-  try {
-    if (process.env.AUTO_REPLY_RULES) {
-      return JSON.parse(process.env.AUTO_REPLY_RULES);
-    }
-  } catch (error) {
-    console.error("Invalid AUTO_REPLY_RULES");
-  }
-
-  return DEFAULT_RULES;
+function respond(res, status, body, type = "application/json") {
+  res.statusCode = status;
+  res.setHeader("Content-Type", type);
+  res.setHeader("Cache-Control", "no-store");
+  res.end(type === "application/json" ? JSON.stringify(body) : String(body));
 }
 
-// FIND MATCHING KEYWORD
-function getReply(message) {
-  const text = String(message || "").toLowerCase().trim();
-
-  for (const rule of getRules()) {
-    if (!rule.keywords || !rule.reply) continue;
-
-    const matched = rule.keywords.some(keyword =>
-      text.includes(String(keyword).toLowerCase())
-    );
-
-    if (matched) return String(rule.reply);
-  }
-
-  return process.env.DEFAULT_AUTO_REPLY ||
-    "Thanks for your message! আমরা শীঘ্রই উত্তর দেব। ❤️";
+function timingSafeEqual(a, b) {
+  const x = Buffer.from(String(a || ""));
+  const y = Buffer.from(String(b || ""));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
 }
 
-// VERIFY META WEBHOOK SIGNATURE
-function verifySignature(body, signature) {
-  if (!APP_SECRET) return false;
+function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
 
-  if (!signature || !signature.startsWith("sha256=")) {
+    req.on("data", (chunk) => {
+      total += chunk.length;
+
+      if (total > MAX_BODY_BYTES) {
+        reject(Object.assign(new Error("Payload too large"), { statusCode: 413 }));
+        req.destroy();
+        return;
+      }
+
+      chunks.push(chunk);
+    });
+
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+    req.on("aborted", () => reject(new Error("Request aborted")));
+  });
+}
+
+function validMetaSignature(rawBody, header) {
+  const secret = process.env.META_APP_SECRET;
+
+  if (!secret || typeof header !== "string" || !header.startsWith("sha256=")) {
     return false;
   }
 
-  const expected =
-    "sha256=" +
-    crypto.createHmac("sha256", APP_SECRET)
-      .update(body)
-      .digest("hex");
+  const received = header.slice(7);
 
-  const a = Buffer.from(expected);
-  const b = Buffer.from(signature);
-
-  return a.length === b.length &&
-    crypto.timingSafeEqual(a, b);
-}
-
-// READ RAW REQUEST BODY
-async function readBody(req) {
-  const chunks = [];
-
-  for await (const chunk of req) {
-    chunks.push(Buffer.from(chunk));
+  if (!/^[a-f0-9]{64}$/i.test(received)) {
+    return false;
   }
 
-  return Buffer.concat(chunks);
+  const expected = crypto
+    .createHmac("sha256", secret)
+    .update(rawBody)
+    .digest("hex");
+
+  return timingSafeEqual(
+    received.toLowerCase(),
+    expected.toLowerCase()
+  );
 }
 
-// SEND WHATSAPP MESSAGE
-async function sendMessage(to, message) {
-  const url =
-    `https://graph.facebook.com/${GRAPH_VERSION}/${PHONE_ID}/messages`;
+function getRules() {
+  let rules;
+
+  try {
+    rules = JSON.parse(process.env.AUTO_REPLY_RULES || "[]");
+  } catch {
+    throw new Error("AUTO_REPLY_RULES is not valid JSON");
+  }
+
+  if (!Array.isArray(rules)) {
+    throw new Error("AUTO_REPLY_RULES must be a JSON array");
+  }
+
+  return rules
+    .filter(
+      (r) =>
+        r &&
+        Array.isArray(r.keywords) &&
+        typeof r.reply === "string" &&
+        r.reply.trim()
+    )
+    .map((r) => ({
+      keywords: r.keywords
+        .filter((k) => typeof k === "string" && k.trim())
+        .map((k) => k.trim().toLocaleLowerCase()),
+      reply: r.reply.trim(),
+    }))
+    .filter((r) => r.keywords.length);
+}
+
+function messageText(message) {
+  if (!message) return "";
+
+  if (message.type === "text") {
+    return message.text?.body || "";
+  }
+
+  if (message.type === "button") {
+    return message.button?.text || message.button?.payload || "";
+  }
+
+  if (message.type === "interactive") {
+    const item = message.interactive || {};
+
+    return (
+      item.button_reply?.title ||
+      item.button_reply?.id ||
+      item.list_reply?.title ||
+      item.list_reply?.id ||
+      ""
+    );
+  }
+
+  if (["image", "document", "video"].includes(message.type)) {
+    return message[message.type]?.caption || "";
+  }
+
+  return "";
+}
+
+function makeReply(text, rules) {
+  const input = String(text || "").trim().toLocaleLowerCase();
+
+  if (!input) return "";
+
+  for (const rule of rules) {
+    if (rule.keywords.some((keyword) => input.includes(keyword))) {
+      return rule.reply;
+    }
+  }
+
+  return (process.env.DEFAULT_AUTO_REPLY || "").trim();
+}
+
+async function redis(command) {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+
+  if (!url || !token) {
+    throw new Error("Upstash Redis is not configured");
+  }
 
   const response = await fetch(url, {
     method: "POST",
 
     headers: {
-      "Authorization": `Bearer ${ACCESS_TOKEN}`,
-      "Content-Type": "application/json"
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
     },
 
-    body: JSON.stringify({
-      messaging_product: "whatsapp",
-      recipient_type: "individual",
-      to: to,
-      type: "text",
-      text: {
-        preview_url: false,
-        body: message
-      }
-    })
+    body: JSON.stringify(command),
+
+    signal: AbortSignal.timeout(TIMEOUT_MS),
   });
 
-  const result = await response.json();
+  const result = await response.json().catch(() => ({}));
 
-  if (!response.ok) {
-    console.error("WhatsApp API Error:", result);
-    throw new Error("Message sending failed");
+  if (!response.ok || result.error) {
+    throw new Error(`Redis error (${response.status})`);
   }
 
-  return result;
+  return result.result;
 }
 
-// MAIN VERCEL WEBHOOK
+async function claim(messageId) {
+  const key = `nexora:whatsapp:message:${messageId}`;
+
+  const result = await redis([
+    "SET",
+    key,
+    "processing",
+    "NX",
+    "EX",
+    DEDUPE_TTL_SECONDS,
+  ]);
+
+  return {
+    key,
+    claimed: result === "OK",
+  };
+}
+
+async function release(key) {
+  try {
+    await redis(["DEL", key]);
+  } catch (error) {
+    console.error("Dedupe cleanup error:", error.message);
+  }
+}
+
+async function sendText(to, body) {
+  const phoneId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+  const token = process.env.WHATSAPP_ACCESS_TOKEN;
+
+  const response = await fetch(
+    `${GRAPH_BASE}/${encodeURIComponent(phoneId)}/messages`,
+    {
+      method: "POST",
+
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to,
+        type: "text",
+
+        text: {
+          preview_url: false,
+          body,
+        },
+      }),
+
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    }
+  );
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    throw new Error(
+      `WhatsApp API ${data?.error?.code || response.status}: ${
+        data?.error?.message || "Send failed"
+      }`
+    );
+  }
+
+  return data;
+}
+
+function verifyQuery(req) {
+  const url = new URL(req.url, "https://vercel.invalid");
+
+  return {
+    mode: url.searchParams.get("hub.mode"),
+    token: url.searchParams.get("hub.verify_token"),
+    challenge: url.searchParams.get("hub.challenge"),
+  };
+}
+
+function checkEnv() {
+  const required = [
+    "WHATSAPP_VERIFY_TOKEN",
+    "WHATSAPP_ACCESS_TOKEN",
+    "WHATSAPP_PHONE_NUMBER_ID",
+    "META_APP_SECRET",
+    "UPSTASH_REDIS_REST_URL",
+    "UPSTASH_REDIS_REST_TOKEN",
+  ];
+
+  const missing = required.filter((key) => !process.env[key]);
+
+  if (missing.length) {
+    throw new Error(
+      `Missing environment variables: ${missing.join(", ")}`
+    );
+  }
+
+  if (!/^v\d+\.\d+$/.test(GRAPH_VERSION)) {
+    throw new Error("Invalid GRAPH_API_VERSION");
+  }
+}
+
 module.exports = async function handler(req, res) {
 
-  // WEBHOOK VERIFICATION
+  // META WEBHOOK VERIFICATION
   if (req.method === "GET") {
-    const mode = req.query["hub.mode"];
-    const token = req.query["hub.verify_token"];
-    const challenge = req.query["hub.challenge"];
+    const { mode, token, challenge } = verifyQuery(req);
 
     if (
       mode === "subscribe" &&
-      VERIFY_TOKEN &&
-      token === VERIFY_TOKEN
+      process.env.WHATSAPP_VERIFY_TOKEN &&
+      timingSafeEqual(token, process.env.WHATSAPP_VERIFY_TOKEN) &&
+      challenge
     ) {
-      res.statusCode = 200;
-      return res.end(challenge || "");
+      return respond(res, 200, challenge, "text/plain");
     }
 
-    res.statusCode = 403;
-    return res.end("Verification failed");
+    return respond(res, 403, {
+      error: "Webhook verification failed",
+    });
   }
 
-  // ONLY POST REQUEST
+  // ONLY GET AND POST ALLOWED
   if (req.method !== "POST") {
     res.setHeader("Allow", "GET, POST");
-    res.statusCode = 405;
-    return res.end("Method not allowed");
-  }
 
-  // CHECK CONFIGURATION
-  if (!VERIFY_TOKEN || !ACCESS_TOKEN || !PHONE_ID || !APP_SECRET) {
-    res.statusCode = 500;
-    return res.end("Missing environment variables");
+    return respond(res, 405, {
+      error: "Method not allowed",
+    });
   }
-
-  let body;
-  let data;
 
   try {
-    body = await readBody(req);
+    checkEnv();
 
-    if (!verifySignature(
-      body,
-      req.headers["x-hub-signature-256"]
-    )) {
-      res.statusCode = 401;
-      return res.end("Invalid signature");
+    // READ ORIGINAL REQUEST BODY
+    const rawBody = await readRawBody(req);
+
+    // VERIFY META SIGNATURE
+    if (
+      !validMetaSignature(
+        rawBody,
+        req.headers["x-hub-signature-256"]
+      )
+    ) {
+      return respond(res, 401, {
+        error: "Invalid webhook signature",
+      });
     }
 
-    data = JSON.parse(body.toString("utf8"));
+    // PARSE JSON
+    let payload;
 
-  } catch (error) {
-    console.error(error);
-    res.statusCode = 400;
-    return res.end("Invalid request");
-  }
+    try {
+      payload = JSON.parse(rawBody.toString("utf8"));
+    } catch {
+      return respond(res, 400, {
+        error: "Invalid JSON",
+      });
+    }
 
-  // CHECK WHATSAPP EVENT
-  if (data.object !== "whatsapp_business_account") {
-    res.statusCode = 200;
-    return res.end("Event ignored");
-  }
+    if (payload.object !== "whatsapp_business_account") {
+      return respond(res, 200, {
+        received: true,
+        ignored: true,
+      });
+    }
 
-  const messages = [];
+    const configuredPhoneId =
+      process.env.WHATSAPP_PHONE_NUMBER_ID;
 
-  for (const entry of data.entry || []) {
-    for (const change of entry.changes || []) {
+    const rules = getRules();
 
-      if (change.field !== "messages") continue;
+    // PROCESS INCOMING EVENTS
+    for (const entry of payload.entry || []) {
+      for (const change of entry.changes || []) {
 
-      const incoming = change.value.messages || [];
+        if (change.field !== "messages") continue;
 
-      for (const message of incoming) {
+        const value = change.value || {};
+
+        const eventPhoneId =
+          value.metadata?.phone_number_id;
+
         if (
-          message.type === "text" &&
-          message.from &&
-          message.id
+          eventPhoneId &&
+          eventPhoneId !== configuredPhoneId
         ) {
-          messages.push(message);
+          console.warn(
+            "Ignored event for a different phone number."
+          );
+
+          continue;
+        }
+
+        for (const msg of value.messages || []) {
+
+          if (!msg?.id || !msg?.from) continue;
+
+          const text = messageText(msg);
+          const reply = makeReply(text, rules);
+
+          if (!reply) continue;
+
+          // DUPLICATE MESSAGE PROTECTION
+          const reservation = await claim(msg.id);
+
+          if (!reservation.claimed) {
+            console.log(
+              "Duplicate message delivery ignored."
+            );
+
+            continue;
+          }
+
+          try {
+            // SEND AUTO REPLY
+            await sendText(msg.from, reply);
+
+            await redis([
+              "SET",
+              reservation.key,
+              "done",
+              "EX",
+              DEDUPE_TTL_SECONDS,
+            ]);
+
+            console.log("Auto-reply sent.");
+
+          } catch (error) {
+            await release(reservation.key);
+            throw error;
+          }
         }
       }
     }
-  }
 
-  // PROCESS INCOMING MESSAGES
-  try {
-    for (const message of messages) {
-
-      const incomingText = message.text.body;
-
-      const reply = getReply(incomingText);
-
-      await sendMessage(message.from, reply);
-
-      console.log(
-        "NEXORA AUTO REPLY SENT:",
-        message.id
-      );
-    }
+    return respond(res, 200, {
+      received: true,
+    });
 
   } catch (error) {
-    console.error("AUTO REPLY ERROR:", error);
-    res.statusCode = 500;
-    return res.end("Reply processing failed");
+    console.error("Webhook error:", error.message);
+
+    const status = Number.isInteger(error.statusCode)
+      ? error.statusCode
+      : 500;
+
+    return respond(res, status, {
+      error:
+        status === 413
+          ? "Payload too large"
+          : "Webhook processing failed",
+    });
   }
-
-  res.statusCode = 200;
-
-  return res.json({
-    success: true,
-    app: "NEXORA AI",
-    received: messages.length,
-    message: "Webhook processed"
-  });
 };
 
-// REQUIRED FOR META SIGNATURE VALIDATION
+// PRESERVE RAW BODY FOR META SIGNATURE VALIDATION
 module.exports.config = {
   api: {
-    bodyParser: false
-  }
+    bodyParser: false,
+  },
 };
